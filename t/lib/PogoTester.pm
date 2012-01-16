@@ -36,12 +36,14 @@ use LWP;
 use Net::SSLeay;
 use Template;
 use YAML::XS qw(LoadFile);
+use File::Copy;
+use File::Path;
 
 use lib "$Bin/../lib";
 use lib "$Bin/../../lib";
 
 use Pogo::Engine;
-use Pogo::Engine::Store;
+use Pogo::Engine::Store qw(store);
 use Pogo::Dispatcher::AuthStore;
 use Pogo::Client;
 use PogoTesterProc;
@@ -416,11 +418,14 @@ Apache 2.0
 =head1 AUTHORS
 
   Andrew Sloane <andy@a1k0n.net>
+  Ian Bettinger <ibettinger@yahoo.com>
   Michael Fischer <michael+pogo@dynamine.net>
   Mike Schilli <m@perlmeister.com>
   Nicholas Harteau <nrh@hep.cat>
   Nick Purvis <nep@noisetu.be>
   Robert Phan <robert.phan@gmail.com>
+  Srini Singanallur <ssingan@yahoo.com>
+  Yogesh Natarajan <yogesh_ny@yahoo.co.in>
 
 =cut
 

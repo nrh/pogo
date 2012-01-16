@@ -27,6 +27,7 @@ use Set::Scalar;
 use Pogo::Engine::Namespace::Slot;
 use Pogo::Engine::Store qw(store);
 use Pogo::Common qw(merge_hash);
+use Pogo::Plugin;
 use JSON qw(encode_json decode_json);
 
 # Naming convention:
@@ -99,6 +100,7 @@ sub fetch_runnable_hosts
     $errc,
     sub {
       my ( $allslots, $hostslots ) = @_;
+
       local *__ANON__ = 'fetch_runnable_hosts:fetch_all_slots:cont';
 
       my $global_lock = store->lock( 'fetch_runnable_hosts:' . $job->id );
@@ -108,7 +110,10 @@ sub fetch_runnable_hosts
           my $slots = $hostslots->{$hostname};
 
           # is this host runnable?
-          next unless $job->host($hostname)->is_runnable;
+          my $host_is_runnable = $job->host($hostname)->is_runnable;
+          INFO "Host $hostname is", ($host_is_runnable ? "" : "n't"),
+               " runnable";
+          next unless $host_is_runnable;
 
           # if any slots have predecessors, then check that they're done
           my @pred_slots;
@@ -163,7 +168,10 @@ sub fetch_all_slots
   my %to_resolve  = ();
   my @slotlookups = ();
 
-  DEBUG Dumper $hostinfo_map;
+  DEBUG "Fetching all slots of job ", $job->id;
+
+  DEBUG sub { local $Data::Dumper::Indent = 1; 
+              return "hostinfo_map: " . Dumper $hostinfo_map; };
 
   my $concurrent = $job->concurrent;
   if ( defined $concurrent )
@@ -185,12 +193,18 @@ sub fetch_all_slots
       $maxdown = scalar $job->hosts;
     }
     $slot->{maxdown} = $maxdown;
+    DEBUG "Maxdown for job ", $job->id, ": $maxdown";
 
     # fill out our hostslots hash
     while ( my ( $hostname, $hostinfo ) = each %$hostinfo_map )
     {
       $hostslots{$hostname} = [$slot];
     }
+
+    DEBUG "Slots/Hostslots: ",
+      sub { local $Data::Dumper::Indent = 1; 
+            return "Slots: " . Dumper($slots) . 
+                   "Hostslots: " . Dumper(\%hostslots); };
 
     # our work here should be done
     return $cont->( $slots, \%hostslots );
@@ -204,51 +218,85 @@ sub fetch_all_slots
   DEBUG Dumper [ $const, $seq ];
 
   # resolve all max_down_hosts for each app-env
+  # debug> p $hostname
+  #  foo13.west.example.com
+  #
+  # debug> x $hostinfo
+  #  0  HASH(0x9e76008)
+  #     'apps' => ARRAY(0x9e75fc8)
+  #        0  'frontend'
+  #     'envs' => HASH(0x9e76028)
+  #        'coast' => HASH(0x9e6dff8)
+  #           'west' => 1
+  #
+  # debug> x $seq
+  #  0  HASH(0x9c55d80)
+  #  'coast' => HASH(0x9c536f8)
+  #     'frontend' => ARRAY(0x9e6c290)
+  #         empty array
+  #
+  # debug> x $const
+  #  0  HASH(0x9e6bad0)
+  #  'coast' => HASH(0x9c558e0)
+  #     'backend' => '"1"'
+  #     'frontend' => '"25%"'
+
   while ( my ( $hostname, $hostinfo ) = each %$hostinfo_map )
   {
     $hostslots{$hostname} = [];
+
+    my $host = $job->host( $hostname, 'waiting' );
+
+    #$DB::single = 1;
+
     foreach my $app ( @{ $hostinfo->{apps} } )
     {
-      foreach my $env ( @{ $hostinfo->{envs} } )
+      foreach my $envtype ( keys %{ $hostinfo->{envs} } )
       {
-        my ( $etype, $ename ) = ( $env->{key}, $env->{value} );
+          foreach my $env ( keys %{ $hostinfo->{envs}->{$envtype} } )
+          {
+              # e.g. $app=frontend $envtype=coast $env=west
 
-        # skip if there are no constraints for this environment
-        next if ( !exists $const->{app}->{$etype} );
+              my $slot = $self->slot( $app, $envtype, $env );
 
-        my $slot = $self->slot( $app, $etype, $ename );
+              # if we have predecessors in the sequence for this 
+              # app/environment, get those slots too
+              if ( exists $seq->{$envtype} && 
+                   exists $seq->{$envtype}->{$app} )
+              {
+                $slot->{pred} = [ map { $self->slot( $_, $envtype, $env ) } 
+                                      @{ $seq->{$envtype}->{$app} } ];
+                DEBUG "Sequence predecessors for "
+                . $slot->name . ": "
+                . join( ", ", map { $_->name } @{ $slot->{pred} } );
+              }
+              push @{ $hostslots{$hostname} }, $slot;
 
-        # if we have predecessors in the sequence for this app/environment, get
-        # those slots too
-        if ( exists $seq->{$etype} && exists $seq->{$ename}->{$app} )
-        {
-          $slot->{pred} = [ map { $self->slot( $_, $etype, $ename ) } @{ $seq->{$etype}->{$app} } ];
-          DEBUG "Sequence predecessors for "
-            . $slot->name . ": "
-            . join( ", ", map { $_->name } @{ $slot->{pred} } );
-        }
-        push @{ $hostslots{$hostname} }, $slot;
+              next unless exists $const->{$envtype} and
+                          exists $const->{$envtype}->{$app};
 
-        my $concur = $const->{$app}->{$etype};
-        if ( $concur !~ m{^(\d+)%$} )
-        {
-          # not a percentage, a literal
-          $slot->{maxdown} = $concur;
-        }
-        else
-        {
-          # we need to resolve the percentage, and we do so asyncronously.
-          my $pct    = $1;
-          my $appexp = $self->app_members($app);
-          my $envexp = $self->env_members($env);
+              my $concur = $const->{$envtype}->{$app};
+              if ( $concur !~ m{^(\d+)%$} )
+              {
+                # not a percentage, a literal
+                $slot->{maxdown} = $concur;
+              }
+              else
+              {
+                # we need to resolve the percentage, and we do so asyncronously.
+                my $pct    = $1;
+                my $appexp = $self->app_members($app);
+                my $envexp = $self->env_members($env);
 
-          $to_resolve{$appexp} = 1;
-          $to_resolve{$envexp} = 1;
+                $to_resolve{$appexp} = 1;
+                $to_resolve{$envexp} = 1;
 
-          push @slotlookups,
-            [ $slot, $appexp, $envexp, $pct ];   # $pct in these to be written by resolv $cont below
-        }
-      }
+                push @slotlookups,
+                [ $slot, $appexp, $envexp, $pct ];   # $pct in these to be written 
+                                                     # by resolv $cont below
+              }
+            }
+       }
     }
   }
 
@@ -265,8 +313,8 @@ sub fetch_all_slots
         my $apptargets = Set::Scalar->new( @{ $resolved->{$appexp} } );
         my $envtargets = Set::Scalar->new( @{ $resolved->{$envexp} } );
 
-        # TODO: do we need to speed this up with Bit::Vector?
-        my $nhosts = scalar @{ $apptargets->intersection($envtargets) };
+        my @hosts = $apptargets->intersection($envtargets);
+        my $nhosts = scalar @hosts;
 
         $slot->{maxdown} = max( 1, int( $pct * $nhosts / 100 ) );
         DEBUG "slot: @$lookup -> $slot->{maxdown} max down";
@@ -330,7 +378,9 @@ sub unlock_job
 sub resolve
 {
   my ( $self, $lookups, $errc, $cont ) = @_;
-  DEBUG Dumper $lookups;
+
+  DEBUG "Resolve calling continuation";
+  $cont->( {} );
 }
 
 # }}}
@@ -344,13 +394,16 @@ sub set_conf
   my $conf_in = dclone $conf_ref;
   my $conf    = {};
 
-  # use default plugins if none are defined
-  #if ( !defined $conf_in->{plugins} )
-  #{
-  #  $conf_in->{plugins}->{targets} = 'Pogo::Plugin::Inline';
-  #}
-
   my $name = $self->name;
+
+  # globals processing
+  foreach my $global ( keys %{ $conf_in->{globals} } )
+  {
+    DEBUG "processing '$name/global/$global'";
+    $conf->{globals}->{$global} = delete $conf_in->{globals}->{$global};
+  }
+
+  delete $conf_in->{globals};
 
   # plugin processing
   foreach my $plugin ( keys %{ $conf_in->{plugins} } )
@@ -381,6 +434,8 @@ sub set_conf
   }
 
   delete $conf_in->{envs};
+
+  #$DB::single = 1;
 
   # constraint processing
   foreach my $c_env_type ( keys %{ $conf_in->{constraints} } )
@@ -424,9 +479,8 @@ sub set_conf
         # $second requires $first to go first within $env
         # $first is a predecessor of $second
         # $second is a successor of $first
-        # we just make sure these exist, don't define them
-        $conf->{seq}->{pred}->{$c_env_type}->{$second}->{$first};
-        $conf->{seq}->{succ}->{$c_env_type}->{$first}->{$second};
+        $conf->{seq}->{pred}->{$c_env_type}->{$second}->{$first} = 1;
+        $conf->{seq}->{succ}->{$c_env_type}->{$first}->{$second} = 1;
       }
     }
 
@@ -548,7 +602,31 @@ sub _get_conf_r
       $c->{$node} = _get_conf_r($p);
     }
   }
-  return $c;
+  return numhash_to_array_r( $c );
+}
+
+sub numhash_to_array_r {
+  my ( $node ) = @_;
+
+  my $num_keys = 0;
+
+  for my $key ( keys %$node ) {
+      my $val = $node->{ $key };
+      if( ref( $val ) eq "HASH" ) {
+          $node->{ $key } = numhash_to_array_r( $val );
+      }
+      $num_keys++ if $key =~ /^\d+$/;
+  }
+
+  if( $num_keys and $num_keys == scalar keys %$node ) {
+      my @a = ();
+      for my $idx (keys %$node) {
+          $a[ $idx ] = $node->{$idx};
+      }
+      return \@a;
+  }
+
+  return $node;
 }
 
 sub get_conf
@@ -561,7 +639,7 @@ sub get_cur
 {
   my ( $self, $app, $key ) = @_;
   my $c = store->get( $self->{path} . "/conf/cur/$app/$key" );
-  return $c;
+  return JSON->new->utf8->allow_nonref->decode($c);
 }
 
 sub get_curs
@@ -579,6 +657,23 @@ sub get_all_curs
   my $self = shift;
   my $path = $self->{path} . "/conf/cur";
   return { map { $_ => $self->get_curs($_) } store->get_children($path) };
+}
+
+sub app_members {
+  my $self = shift;
+  my $app  = shift;
+
+  my $path = $self->{path} . "/conf/apps/$app";
+  return store->get_children("$path");
+}
+
+sub env_members {
+  my $self      = shift;
+  my $envtype   = shift;
+  my $envvalue  = shift;
+
+  my $path = $self->{path} . "/conf/envs/$envtype/$envvalue";
+  return store->get_children("$path");
 }
 
 sub get_all_seqs
@@ -674,20 +769,15 @@ sub get_seq_successors
 sub target_plugin
 {
   my $self = shift;
-  my $name = $self->get_conf->{plugins}->{targets} || 'Pogo::Plugin::Inline';
+  if ( !exists $self->{_plugin_cache}->{planner} ){
+      $self->{_plugin_cache}->{planner} = Pogo::Plugin->load( 'Planner', { required_methods => ['expand_targets','fetch_target_meta'] } );
 
-  if ( !exists $self->{_plugin_cache}->{$name} )
-  {
-    eval "use $name;";
-    # this is a coderef because we want to make sure the data is fresh
-    # the plugin should do caching of it's own metadata, not the configuration
-    $self->{_plugin_cache}->{$name} = $name->new(
-      conf      => sub { $self->get_conf },
-      namespace => $self->name,
-    );
+      # set conf code and namespace
+      $self->{_plugin_cache}->{planner}->conf( sub { $self->get_conf } );
+      $self->{_plugin_cache}->{planner}->namespace( $self->name );
   }
 
-  return $self->{_plugin_cache}->{$name};
+  return $self->{_plugin_cache}->{planner};
 }
 
 # }}}
@@ -704,44 +794,10 @@ sub expand_targets
 
 sub fetch_target_meta
 {
-  my ( $self, $target, $errc, $cont ) = @_;
-  return $self->target_plugin->fetch_target_meta( $target, $errc, $cont );
-}
-
-# }}}
-# {{{ deprecated appgroup stuff
-# i'm not sure we need this if we move to the new config format
-
-sub translate_appgroups
-{
-  my ( $self, $apps ) = @_;
-
-  my %g;
-
-  foreach my $app (@$apps)
-  {
-    my @groups = store->get_children( $self->path("/conf/appgroups/byrole/$app") );
-    if (@groups)
-    {
-      map { $g{$_} = 1 } @groups;
-    }
-    else
-    {
-      $g{$app} = 1;
-    }
-  }
-
-  return [ keys %g ];
-}
-
-sub appgroup_members
-{
-  my ( $self, $appgroup ) = @_;
-
-  my @members = store->get_children( $self->path("/conf/appgroups/bygroup/$appgroup") );
-
-  return @members if @members;
-  return $appgroup;
+  my ( $self, $target, $nsname, $errc, $cont ) = @_;
+  DEBUG __PACKAGE__, "::fetch_target_meta";
+  return $self->target_plugin->fetch_target_meta( $target, $nsname, 
+                                                  $errc, $cont );
 }
 
 #}}}
@@ -751,6 +807,7 @@ sub appgroup_members
 sub unlock_host
 {
   my ( $self, $job, $host, $unlockseq ) = @_;
+  DEBUG __PACKAGE__, "::unlock_host";
 
   return LOGDIE "unlock_host is deprecated";
 
@@ -809,25 +866,89 @@ sub unlock_host
 
 =head1 NAME
 
-  CLASSNAME - SHORT DESCRIPTION
+  Pogo::Engine::Namespace
 
 =head1 SYNOPSIS
 
-CODE GOES HERE
+  # internal pogo api
 
 =head1 DESCRIPTION
 
-LONG_DESCRIPTION
+This module contains helper functions for configuration and execution of
+the constraints engine. To set the configuration for the namespace, use
 
-=head1 METHODS
+    $ns->set_conf($conf);
 
-B<methodexample>
+where $conf is a data structure obtained from a YAML file as shown below.
+The configuration is plugin-driven, and by default, it uses the
+Inline.pm plugin:
 
-=over 2
+    plugins:
+      targets: Pogo::Plugin::Inline
 
-methoddescription
+The Inline plugin allows
+(see the detailed Pogo::Plugin::Inline doc for details) for
+defining apps (targets, hosts), envs (key/value settings for targets), 
+sequences and constraints, like
 
-=back
+    apps:
+      frontend:
+        - foo[1-101].east.example.com
+        - foo[1-101].west.example.com
+      backend:
+        - bar[1-10].east.example.com
+        - bar[1-10].west.example.com
+    
+    envs:
+      coast:
+        east:
+          - foo[1-101].east.example.com
+          - bar[1-10].east.example.com
+        west:
+          - foo[1-101].west.example.com
+          - bar[1-10].west.example.com
+    
+    constraints:
+      coast:
+        concurrency:
+          - frontend: 25%
+          - backend: 1
+        sequence:
+          - [ backend, frontend ]
+
+which Pogo::Engine::Namespace transforms into a directory/file
+hierarchy in ZooKeeper for later processing by the dispatcher. 
+
+The apps (targets) defined above are stored like this:
+
+    /pogo/ns/nsname/conf/apps/backend/0: ["bar[1-10].east.example.com"]
+    /pogo/ns/nsname/conf/apps/backend/1: ["bar[1-10].west.example.com"]
+    /pogo/ns/nsname/conf/apps/frontend/0: ["foo[1-101].east.example.com"]
+    /pogo/ns/nsname/conf/apps/frontend/1: ["foo[1-101].west.example.com"]
+
+Constraints on 
+
+For every environment type (e.g. 'coast'), the apps are mapped 
+The constraints:
+
+    /pogo/ns/nsname/conf/cur/coast/backend: ["1"]
+    /pogo/ns/nsname/conf/cur/coast/frontend: ["25%"]
+
+Env settings:
+
+    /pogo/ns/nsname/conf/envs/coast/east/0: ["foo[1-101].east.example.com"]
+    /pogo/ns/nsname/conf/envs/coast/east/1: ["bar[1-10].east.example.com"]
+    /pogo/ns/nsname/conf/envs/coast/west/0: ["foo[1-101].west.example.com"]
+    /pogo/ns/nsname/conf/envs/coast/west/1: ["bar[1-10].west.example.com"]
+
+Sequences:
+
+    /pogo/ns/nsname/conf/seq/pred/coast/frontend/backend
+    /pogo/ns/nsname/conf/seq/succ/coast/backend/frontend
+
+And even the plugin gets stored:
+
+    /pogo/ns/nsname/conf/plugins/targets: ["Pogo::Plugin::Inline"]
 
 =head1 SEE ALSO
 
@@ -840,11 +961,14 @@ Apache 2.0
 =head1 AUTHORS
 
   Andrew Sloane <andy@a1k0n.net>
+  Ian Bettinger <ibettinger@yahoo.com>
   Michael Fischer <michael+pogo@dynamine.net>
   Mike Schilli <m@perlmeister.com>
   Nicholas Harteau <nrh@hep.cat>
   Nick Purvis <nep@noisetu.be>
   Robert Phan <robert.phan@gmail.com>
+  Srini Singanallur <ssingan@yahoo.com>
+  Yogesh Natarajan <yogesh_ny@yahoo.co.in>
 
 =cut
 

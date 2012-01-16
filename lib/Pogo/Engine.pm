@@ -103,15 +103,20 @@ sub hostinfo
 
   # call this asyncronously as it may be ugly
   $ns->fetch_target_meta(
-    $target,
+    [$target],
+    $namespace,
     sub {
       my $err = shift;
+      ERROR "fetch_target_meta returned '$err'";
       return $resp->set_error($err);
     },
     sub {
-      my ( $results, $hosts ) = @_;
-      $resp->add_header( hosts => join( ',', @$hosts ) );
-      $resp->set_records( [$results] );
+      my ( $results ) = @_;
+
+      DEBUG sub { "fetch_target_meta success: results=" . Dumper( $results ); };
+
+      $resp->add_header( hosts => join( ',', keys %$results ) );
+      $resp->set_records( [$results->{$target}] );
       return $resp->set_ok;
     },
   );
@@ -284,14 +289,14 @@ sub jobretry
     return $resp;
   }
 
-  if ( ( $job->start_time + $job->job_timeout ) <= time )
+  if ( $job->is_expired() )
   {
     $resp->set_error("jobid $jobid has expired");
     return $resp;
   }
 
   my $out = [ map { $job->retry_task($_) } @$hostnames ];
-  DEBUG Dumper [ $out, $hostnames ];
+  DEBUG sub { Dumper [ $out, $hostnames ] };
   $instance->add_task( 'resumejob', $job->{id} );
 
   $resp->set_records($out);
@@ -351,16 +356,22 @@ sub jobstatus
 {
   my ( $class, $jobid ) = @_;
   my $job = $instance->job($jobid);
+
   my $resp = Pogo::Engine::Response->new()->add_header( action => 'jobstatus' );
 
   if ( !defined $job )
   {
+    ERROR "jobstatus: jobid $jobid not found";
     $resp->set_error("jobid $jobid not found");
     return $resp;
   }
+  INFO "jobstatus of $jobid: ", $job->state;
   $resp->add_record( $job->state );
   my @hostlist = map { $resp->add_record( [ $_->name, $_->state ] ) } $job->hosts;
   $resp->add_header( hosts => join ',', @hostlist );
+  $resp->add_header( start_time   => int($job->start_time) );
+  $resp->add_header( current_time => time );
+  $resp->add_header( is_expired => $job->is_expired );
   $resp->set_ok;
 
   return $resp;
@@ -483,13 +494,20 @@ sub run
 {
   my ( $class, %args ) = @_;
   my $resp = Pogo::Engine::Response->new()->add_header( action => 'run' );
-  foreach my $arg (qw(user run_as command range password namespace secrets))
+  foreach my $arg (qw(user run_as command range namespace secrets))
   {
     if ( !exists $args{$arg} )
     {
       $resp->set_error("missing '$arg'");
       return $resp;
     }
+  }
+
+  unless (exists $args{'password'} || exists $args{'client_private_key'})
+  {
+    $resp->set_error("Either password or passphrase and client_private_key combination " .
+                     "needs to be provided with 'run' request");
+    return $resp;
   }
 
   my $run_as  = $args{run_as};
@@ -503,7 +521,9 @@ sub run
 
   my $opts = {};
   foreach my $arg (
-    qw(invoked_as namespace range user run_as password timeout job_timeout command retry prehook posthook secrets email im_handle client requesthost concurrent exe_name exe_data)
+    qw(invoked_as namespace range user run_as password pvt_key_passphrase client_private_key 
+       timeout job_timeout command retry prehook posthook secrets email root_type
+       im_handle client requesthost concurrent exe_name exe_data)
     )
   {
     $opts->{$arg} = $args{$arg} if exists $args{$arg};
@@ -612,11 +632,14 @@ Apache 2.0
 =head1 AUTHORS
 
   Andrew Sloane <andy@a1k0n.net>
+  Ian Bettinger <ibettinger@yahoo.com>
   Michael Fischer <michael+pogo@dynamine.net>
   Mike Schilli <m@perlmeister.com>
   Nicholas Harteau <nrh@hep.cat>
   Nick Purvis <nep@noisetu.be>
   Robert Phan <robert.phan@gmail.com>
+  Srini Singanallur <ssingan@yahoo.com>
+  Yogesh Natarajan <yogesh_ny@yahoo.co.in>
 
 =cut
 

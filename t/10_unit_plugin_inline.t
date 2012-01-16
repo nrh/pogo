@@ -17,7 +17,7 @@ use 5.008;
 use common::sense;
 
 use Test::Exception;
-use Test::More tests => 15;
+use Test::More tests => 18;
 
 use Carp qw(confess);
 use Data::Dumper;
@@ -37,7 +37,7 @@ chdir($Bin);
 
 ok( Log::Log4perl::init("$Bin/conf/log4perl.conf"), "log4perl" );
 
-use Pogo::Plugin::Inline;
+use Pogo::Plugin::Planner::Default;
 
 sub hsort
 {
@@ -51,6 +51,29 @@ sub hsort
   return $ahost cmp $bhost
     || $a cmp $b;
 }
+
+sub conf_read {
+    my $conf_file = "$Bin/conf/example.yaml";
+    my $data = LoadFile( $conf_file );
+}
+
+my $pl = Pogo::Plugin::Planner::Default->new();
+$pl->conf( \&conf_read );
+
+my $result;
+my $target = "foo97.east.example.com";
+my $data = $pl->fetch_target_meta(
+    [$target],
+    "somenamespace",
+    sub { print "in errsub\n"; },
+    sub { $result = $_[0] },
+);
+
+is( ref($result), "HASH", "fetch_target_meta on yaml" );
+is( $result->{$target}->{apps}->[0], 
+    "frontend", "fetch_target_meta on yaml" );
+is( $result->{$target}->{envs}->{coast}->{east}, "1", 
+    "fetch_target_meta on yaml" );
 
 my %input = (
   'foo[1-2]'     => [ sort hsort ( 'foo1', 'foo2' ) ],
@@ -68,7 +91,7 @@ my %input = (
 
 while ( my ( $expr, $res ) = each %input )
 {
-  my $flat      = Pogo::Plugin::Inline->expand_targets( [$expr] );
+  my $flat      = Pogo::Plugin::Planner::Default->expand_targets( [$expr] );
   my $size_flat = scalar @$flat;
   my $size_expr = scalar @$res;
   is( $size_flat, $size_expr, "$expr size" )
@@ -81,7 +104,7 @@ my $all_expr = [ sort hsort keys %input ];
 my @all_res;
 foreach my $res ( @input{ @$all_expr } ) { push @all_res, @$res; }
 
-my $all_flat      = Pogo::Plugin::Inline->expand_targets($all_expr);
+my $all_flat      = Pogo::Plugin::Planner::Default->expand_targets($all_expr);
 my $all_res_size  = scalar @all_res;
 my $all_flat_size = scalar @$all_flat;
 

@@ -70,6 +70,7 @@ sub run    #{{
   # start these puppies up
   Pogo::Engine->init($instance);
   Pogo::Dispatcher::AuthStore->init($instance);
+  load_root_transform();
 
   # handle workers
   tcp_server(
@@ -108,6 +109,47 @@ sub run    #{{
 }
 
 # }}}
+
+# Loads root transforms from plugins into Zookeeper
+sub load_root_transform
+{
+  eval { load_root_plugin(); };
+  LOGDIE $@ if $@;
+  my $path = "/pogo/root/";
+  while ( my ( $k, $v ) = each( %{ $instance->{root} } ) )
+  {
+    store->delete( $path . $k );
+    store->create( $path . $k, $v )
+      or LOGDIE "couldn't create '$path' node: " . store->get_error_name;
+  }
+}
+
+# Look into Pogo/Plugin/Root for root transform plugins
+# The plugins should have the following interface
+# sub root_type : returns root type string
+# sub transform : return transform string
+# sub priority  : return priority integer
+# Creates a hash of root_type:transform from the plugins
+# along with an entry default:root_type
+# which is the root_type with highest priority
+sub load_root_plugin
+{
+  # holds name and priority of default root
+  my @default_root;
+
+  foreach my $root_plugin (
+    Pogo::Plugin->load_multiple( 'Root', { required_methods => [ 'root_type', 'transform' ] } ) )
+  {
+    DEBUG "processing Root type: " . $root_plugin->root_type();
+
+    # add this root transform to our list
+    $instance->{root}->{ $root_plugin->root_type() } = $root_plugin->transform();
+  }
+
+  # record our default root type, which is still stored in Pogo::Plugin
+  $instance->{root}->{default} =
+    Pogo::Plugin->load( 'Root', { required_methods => [ 'root_type', 'transform' ] } )->root_type();
+}
 
 sub purge_queue
 {
@@ -316,6 +358,11 @@ sub instance
   return $instance;
 }
 
+sub target_keyring
+{
+  return $instance->{target_keyring};
+}
+
 # }}}
 
 1;
@@ -355,11 +402,14 @@ Apache 2.0
 =head1 AUTHORS
 
   Andrew Sloane <andy@a1k0n.net>
+  Ian Bettinger <ibettinger@yahoo.com>
   Michael Fischer <michael+pogo@dynamine.net>
   Mike Schilli <m@perlmeister.com>
   Nicholas Harteau <nrh@hep.cat>
   Nick Purvis <nep@noisetu.be>
   Robert Phan <robert.phan@gmail.com>
+  Srini Singanallur <ssingan@yahoo.com>
+  Yogesh Natarajan <yogesh_ny@yahoo.co.in>
 
 =cut
 

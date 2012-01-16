@@ -58,6 +58,7 @@ my %ZOO_ERROR_NAME   = map { $_->[1] => $_->[0] } @ZOO_ERRORS;
 sub new
 {
   my ( $class, $opts ) = @_;
+
   my @serverlist =
     defined $opts->{serverlist}
     ? @{ $opts->{serverlist} }
@@ -68,19 +69,34 @@ sub new
   my $serverlist = pop(@serverlist) . ":$serverport";
   map { $serverlist .= ",$_:$serverport" } @serverlist;
 
-  DEBUG "serverlist=$serverlist";
+  INFO "Connecting to serverlist=$serverlist";
 
-  my $self = { handle => Net::ZooKeeper->new($serverlist), };
+  my $self = { handle => Net::ZooKeeper->new($serverlist) };
   LOGDIE "couldn't init zookeeper: $!" unless defined $self->{handle}->{session_id};
+
+  INFO "Connected to serverlist=$serverlist";
+
   bless $self, $class;
 
-  INFO "Connected to '$serverlist'";
+  if( !$opts->{noinit} )
+  {
+      $self->init($opts);
+  }
+
+  return $self;
+}
+
+sub init
+{
+  my ( $self, $opts ) = @_;
+
   DEBUG sprintf( "Session timeout is %.2f seconds.\n", $self->{handle}->{session_timeout} / 1000 );
 
   $self->{handle}->{data_read_len} = 1048576;
 
   # this is sorta ugly, but whatever
-  foreach my $path (qw{/pogo /pogo/ns /pogo/job /pogo/host /pogo/lock /pogo/stats /pogo/taskq})
+  foreach
+    my $path (qw{/pogo /pogo/ns /pogo/job /pogo/host /pogo/lock /pogo/stats /pogo/taskq /pogo/root})
   {
     if ( !$self->exists($path) )
     {
@@ -127,8 +143,12 @@ sub ping
 sub create
 {
   my ( $self, $path, $contents, %opts ) = @_;
+
   $opts{acl} ||= ZK_ACL;
   my $ret;
+
+  DEBUG "zk create $path $contents";
+
   eval { $ret = $self->{handle}->create( $path, $contents, %opts ); };
   return $ret;
 }
@@ -253,10 +273,43 @@ sub unlock
 sub stat         { return shift->{handle}->stat(@_); }
 sub exists       { return shift->{handle}->exists(@_); }
 sub get          { return shift->{handle}->get(@_); }
-sub set          { return shift->{handle}->set(@_); }
-sub delete       { return shift->{handle}->delete(@_); }
+sub set          { 
+  DEBUG "zk set @_";
+  return shift->{handle}->set(@_); 
+}
+sub delete       { 
+  DEBUG "zk delete @_";
+  return shift->{handle}->delete(@_); 
+}
 sub get_children { return shift->{handle}->get_children(@_); }
 sub get_error    { return shift->{handle}->get_error(@_); }
+
+  # traverse tree recursively
+sub traverse {
+    my($self, $path, $callback, $args) = @_;
+
+    $callback->( $self, $path, $args );
+
+    for my $childname ( $self->get_children( $path ) ) {
+        $self->traverse( "$path/$childname", $callback, $args );
+    }
+}
+
+sub _dump {
+    my($self, $path) = @_;
+
+    my $string = "";
+
+    $self->traverse( $path, 
+                     sub {
+                         my($self, $path, $args) = @_;
+                         my $content = $self->get( $path );
+                         $content = '[undef]' unless defined $content;
+                         $string .= "$path: $content\n";
+                     }
+    );
+    return $string;
+}
 
 1;
 
@@ -295,11 +348,14 @@ Apache 2.0
 =head1 AUTHORS
 
   Andrew Sloane <andy@a1k0n.net>
+  Ian Bettinger <ibettinger@yahoo.com>
   Michael Fischer <michael+pogo@dynamine.net>
   Mike Schilli <m@perlmeister.com>
   Nicholas Harteau <nrh@hep.cat>
   Nick Purvis <nep@noisetu.be>
   Robert Phan <robert.phan@gmail.com>
+  Srini Singanallur <ssingan@yahoo.com>
+  Yogesh Natarajan <yogesh_ny@yahoo.co.in>
 
 =cut
 

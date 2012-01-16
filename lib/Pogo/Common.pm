@@ -16,17 +16,14 @@ package Pogo::Common;
 
 use 5.008;
 use Exporter 'import';
-use LWP::UserAgent qw();
 use Log::Log4perl qw(:easy);
+use Pogo::Plugin;
 use URI;
 use URI::file;
 
 our $PREFIX    = '/usr/local';
 our $VERSION   = '4.0';
-our $USERAGENT = LWP::UserAgent->new(
-  timeout => 65,
-  agent   => "Pogo/$VERSION",
-);
+our $USERAGENT = Pogo::Plugin->load( 'UserAgent', { required_methods => [ 'get', 'request' ] } );
 
 our $CONFIGDIR   = '/usr/local/etc/pogo/';
 our $WORKER_CERT = "$CONFIGDIR/worker.cert";
@@ -120,11 +117,14 @@ limitations under the License.
 =head1 AUTHORS
 
   Andrew Sloane <andy@a1k0n.net>
+  Ian Bettinger <ibettinger@yahoo.com>
   Michael Fischer <michael+pogo@dynamine.net>
   Mike Schilli <m@perlmeister.com>
   Nicholas Harteau <nrh@hep.cat>
   Nick Purvis <nep@noisetu.be>
   Robert Phan <robert.phan@gmail.com>
+  Srini Singanallur <ssingan@yahoo.com>
+  Yogesh Natarajan <yogesh_ny@yahoo.co.in>
 
 =cut
 

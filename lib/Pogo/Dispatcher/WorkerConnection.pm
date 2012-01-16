@@ -134,14 +134,17 @@ sub queue_task
   $self->{handle}->push_write(
     json => [
       "execute",
-      { job_id   => $job->id,
-        command  => $job->worker_command,
-        user     => $job->user,
-        run_as   => $job->run_as,
-        password => $job->password,
-        host     => $host,
-        timeout  => $job->timeout,
-        secrets  => $job->secrets,
+      { job_id             => $job->id,
+        command            => $job->worker_command,
+        command_root_transform => $job->command_root_transform,
+        user               => $job->user,
+        run_as             => $job->run_as,
+        password           => $job->password,
+        pvt_key_passphrase => $job->pvt_key_passphrase,
+        client_private_key => $job->client_private_key, 
+        host               => $host,
+        timeout            => $job->timeout,
+        secrets            => $job->secrets,
       }
     ]
   );
@@ -198,11 +201,14 @@ Apache 2.0
 =head1 AUTHORS
 
   Andrew Sloane <andy@a1k0n.net>
+  Ian Bettinger <ibettinger@yahoo.com>
   Michael Fischer <michael+pogo@dynamine.net>
   Mike Schilli <m@perlmeister.com>
   Nicholas Harteau <nrh@hep.cat>
   Nick Purvis <nep@noisetu.be>
   Robert Phan <robert.phan@gmail.com>
+  Srini Singanallur <ssingan@yahoo.com>
+  Yogesh Natarajan <yogesh_ny@yahoo.co.in>
 
 =cut
 

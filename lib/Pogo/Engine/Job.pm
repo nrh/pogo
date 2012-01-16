@@ -25,11 +25,13 @@ use JSON;
 use Log::Log4perl qw(:easy);
 use MIME::Base64 qw(encode_base64);
 use Time::HiRes qw(time);
+use JSON::XS qw(encode_json decode_json);
 
 use Pogo::Common;
 use Pogo::Engine::Store qw(store);
 use Pogo::Engine::Job::Host;
 use Pogo::Dispatcher::AuthStore;
+use Pogo::Dispatcher;
 
 # wait 100ms for other hosts to finish before finding the next set of
 # runnable hosts
@@ -54,11 +56,14 @@ sub new
 {
   my ( $class, $args ) = @_;
 
-  foreach my $opt (qw(target namespace user run_as password command timeout job_timeout))
+  foreach my $opt (qw(target namespace user run_as command timeout job_timeout))
   {
     LOGDIE "missing require job parameter '$opt'"
       unless exists $args->{$opt};
   }
+
+  LOGDIE "need atleast one authenticaton mechanism"
+    unless ( $args->{password} || $args->{client_private_key} );
 
   my $ns = $args->{namespace};
 
@@ -71,7 +76,7 @@ sub new
   my $jobpath = store->create_sequence( '/pogo/job/p', $jobstate )
     or LOGDIE "Unable to create job node: " . store->get_error_name;
 
-  $jobpath =~ m{/(p\d+)$} or LOGDIE "malformed job path";
+  $jobpath =~ m{/(p\d+)$} or LOGDIE "malformed job path: $jobpath";
   $self->{id}   = $1;
   $self->{path} = $jobpath;
   $self->{ns}   = Pogo::Engine->namespace($ns);
@@ -86,20 +91,34 @@ sub new
 
   bless $self, $class;
 
-  my $target = delete $args->{target};
+  my $target_keyring = $self->{ns}->get_conf->{globals}->{target_keyring};
+  $target_keyring = Pogo::Dispatcher->target_keyring
+    unless defined $target_keyring;
+  LOGDIE "The job needs to be signed"
+    if ( $target_keyring && ( !defined $args->{signature} ) );
+
+  $args->{target}         = encode_json( $args->{target} );
+  $args->{target_keyring} = encode_json( $target_keyring )
+    if ( defined $target_keyring );
+  $args->{signature_fields} = encode_json( $args->{signature_fields} )
+    if ( defined $args->{signature_fields} );
+  $args->{signature} = encode_json( $args->{signature} )
+    if ( defined $args->{signature} );
 
   # 'higher security tier' job arguments like encrypted passwords & passphrases
   # get stuffed into the distributed password store instead of zookeeper
   # (because we don't want them to show up in zk's disk snapshot)
-  my $pw      = delete $args->{password};
-  my $secrets = delete $args->{secrets};
+  my $pw                 = delete $args->{password};
+  my $pvt_key_passphrase = delete $args->{pvt_key_passphrase};
+  my $client_private_key = delete $args->{client_private_key};
+  my $secrets            = delete $args->{secrets};
 
   my $expire = $args->{job_timeout} + time() + 60;
-  Pogo::Dispatcher::AuthStore->instance->store( $self->{id}, $pw, $secrets, $expire );
+  Pogo::Dispatcher::AuthStore->instance->store( $self->{id}, $pw, $secrets, $expire,
+    $pvt_key_passphrase, $client_private_key );
 
   # store all non-secure items in zk
   while ( my ( $k, $v ) = each %$args ) { $self->set_meta( $k, $v ); }
-  $self->set_meta( 'target', encode_json($target) );
 
   Pogo::Engine->add_task( 'startjob', $self->{id} );
 
@@ -315,7 +334,13 @@ sub retry_task
 {
   DEBUG Dumper [@_];
   my ( $self, $hostname ) = @_;
-  die "no host $hostname in job" if ( !$self->has_host($hostname) );
+
+  if ( !$self->has_host($hostname) ) {
+      die "no host $hostname in job (" . 
+        join(", ", map { $_->name() } $self->hosts() ) . 
+        ")";
+  }
+
   my $host = $self->host($hostname);
   if ( $host->state eq 'failed' or $host->state eq 'finished' )
   {
@@ -498,18 +523,33 @@ sub start_job_timeout
 # }}}
 # {{{ various accessors
 
-sub password    { return $_[0]->_get_secrets()->[0]; }
-sub secrets     { return $_[0]->_get_secrets()->[1]; }
-sub namespace   { return $_[0]->{ns} }
-sub id          { return $_[0]->{id} }
-sub user        { return $_[0]->meta('user'); }
-sub run_as      { return $_[0]->meta('run_as'); }
-sub timeout     { return $_[0]->meta('timeout'); }
-sub job_timeout { return $_[0]->meta('job_timeout'); }
-sub retry       { return $_[0]->meta('retry'); }
-sub command     { return $_[0]->meta('command'); }
-sub concurrent  { return $_[0]->meta('concurrent'); }
-sub state       { return store->get( $_[0]->{path} ); }
+sub password           { return $_[0]->_get_secrets()->[0]; }
+sub secrets            { return $_[0]->_get_secrets()->[1]; }
+sub pvt_key_passphrase { return $_[0]->_get_secrets()->[3]; }
+sub client_private_key { return $_[0]->_get_secrets()->[4]; }
+sub namespace          { return $_[0]->{ns} }
+sub id                 { return $_[0]->{id} }
+sub user               { return $_[0]->meta('user'); }
+sub run_as             { return $_[0]->meta('run_as'); }
+sub timeout            { return $_[0]->meta('timeout'); }
+sub job_timeout        { return $_[0]->meta('job_timeout'); }
+sub retry              { return $_[0]->meta('retry'); }
+sub command            { return $_[0]->meta('command'); }
+sub concurrent         { return $_[0]->meta('concurrent'); }
+sub state              { return store->get( $_[0]->{path} ); }
+
+# Returns the transform for a given root type
+# root_type precedence :
+# root_type param in client.conf >
+# root_type param in namespace >
+# zookeeper /pogo/root/default
+sub command_root_transform
+{
+  my $root = $_[0]->meta('root_type');
+  $root = $_[0]->{ns}->get_conf->{globals}->{root_type} unless $root;
+  $root = store->get("/pogo/root/default") unless $root;
+  return store->get( "/pogo/root/" . $root );
+}
 
 sub set_state
 {
@@ -566,17 +606,23 @@ sub start
       };
 
       my $fetch_cont = sub {
+        my ($hinfo) = @_;
         local *__ANON__ = 'AE:cb:fetch_target_meta:cont';
         DEBUG $self->id . ": adding hosts";
         DEBUG $self->id . ": computing slots";
-        $self->fetch_runnable_hosts();
+        DEBUG sub { "Calling fetch_runnable_hosts with " . Dumper($hinfo) };
+        $ns->fetch_runnable_hosts( $self, $hinfo, $errc, $cont );
+        DEBUG "Job after fetch_runnable_hosts: ", $self;
       };
 
-      $ns->fetch_target_meta( $flat_targets, $ns->name, $fetch_errc, $fetch_cont, );
+      DEBUG "Calling fetch_target_meta for @$flat_targets";
+      $ns->fetch_target_meta( $flat_targets, $ns->name, $fetch_errc, $fetch_cont );
+      DEBUG "After fetch_target_meta";
+      return 1;
     }
     else    # concurrent codepath
     {
-      DEBUG "we are concurrent.";
+      DEBUG "We are concurrent, flat targets are: @$flat_targets";
       foreach my $hostname (@$flat_targets)
       {
         my $host = $self->host( $hostname, 'waiting' );
@@ -771,6 +817,8 @@ sub continue
         return;
       }
 
+      DEBUG "nqueued=$nqueued nwaiting=$nwaiting";
+
       if ( $nqueued == 0 && $nwaiting > 0 )
       {
 
@@ -786,7 +834,7 @@ sub continue
         }
       }
 
-      return $cont->( $nqueued, $nwaiting );
+      return $cont->( $runnable, $unrunnable, $global_lock );
     }
   );
 }
@@ -818,13 +866,57 @@ sub log
 
 # determine job start time by the first log entry's timestamp
 # TODO: what's the retval when the first log entry isn't valid JSON?
+sub is_expired
+{
+  my ($self) = @_;
+
+  my $start_time  = $self->start_time;
+  my $job_timeout = $self->job_timeout;
+  my $job_id      = $self->id();
+
+  DEBUG "job=$job_id start_time=$start_time job_timeout=$job_timeout ",
+        "time=", time;
+
+  if ( ( $start_time + $job_timeout ) <= time )
+  {
+    INFO "Job $job_id expired " .
+        int( time - $start_time - $job_timeout ),
+        " seconds ago.";
+    return 1;
+  }
+
+  DEBUG "Job $job_id still active for another ",
+    int( $start_time + $job_timeout - time ), " seconds.";
+
+  return 0;
+}
+
+# determine job start time by the first log entry's timestamp
+# TODO: what's the retval when the first log entry isn't valid JSON?
 sub start_time
 {
   my ($self) = @_;
-  if ( my $data = store->get( $self->{path} . '/log/' . _lognode(0) ) )
+
+  my $start_time = 0;
+
+  if ( my $json = store->get( $self->{path} . '/log/' . _lognode(0) ) )
   {
-    return eval { $data = decode_json $data; return $data->[0]; };
+    my $data;
+    eval {
+        $data = decode_json $json;
+    };
+
+    if($@ or ref($data) ne "ARRAY") {
+        ERROR "Whoa, invalid JSON, can't determine start_time: $json";
+    } else {
+        $start_time = $data->[0];
+    }
+  } else {
+    ERROR "Lognode not found, can't determine job start time";
   }
+
+  DEBUG "Start time of job ", $self->id(), " is $start_time";
+  return $start_time;
 }
 
 sub _lognode
@@ -1009,9 +1101,17 @@ sub snapshot
 
 sub worker_command
 {
-  my $self        = shift;
-  my %meta        = $self->all_meta;
-  my $exe         = delete $meta{exe_data} || '';
+  my $self = shift;
+  my %meta = $self->all_meta;
+  my $exe  = delete $meta{exe_data} || '';
+  $meta{target}         = decode_json( $meta{target} );
+  $meta{target_keyring} = decode_json( $meta{target_keyring} )
+    if ( defined $meta{target_keyring} );
+  $meta{signature_fields} = decode_json( $meta{signature_fields} )
+    if ( defined $meta{signature_fields} );
+  $meta{signature} = decode_json( $meta{signature} )
+    if ( defined $meta{signature} );
+
   my $worker_stub = read_file( Pogo::Dispatcher->instance->worker_script )
     . encode_perl(
     { job => $self->id,
@@ -1106,11 +1206,14 @@ Apache 2.0
 =head1 AUTHORS
 
   Andrew Sloane <andy@a1k0n.net>
+  Ian Bettinger <ibettinger@yahoo.com>
   Michael Fischer <michael+pogo@dynamine.net>
   Mike Schilli <m@perlmeister.com>
   Nicholas Harteau <nrh@hep.cat>
   Nick Purvis <nep@noisetu.be>
   Robert Phan <robert.phan@gmail.com>
+  Srini Singanallur <ssingan@yahoo.com>
+  Yogesh Natarajan <yogesh_ny@yahoo.co.in>
 
 =cut
 
